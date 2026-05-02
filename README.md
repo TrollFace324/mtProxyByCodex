@@ -23,7 +23,7 @@ cd mtProxyByCodex
 sudo bash install.sh
 ```
 
-По умолчанию прокси поднимается на `443/tcp` с FakeTLS-доменом `www.microsoft.com`.
+По умолчанию прокси поднимается на `443/tcp`, использует исходящие соединения к Telegram по IPv4 и генерирует FakeTLS-домен вида `<public-ip>.sslip.io`.
 
 ## Установка с параметрами
 
@@ -36,9 +36,11 @@ sudo bash install.sh --port 8443 --host www.cloudflare.com
 ```text
 --port PORT          Порт, по умолчанию 443
 --bind ADDR:PORT     Полный адрес bind, по умолчанию 0.0.0.0:<port>
---host HOSTNAME      Домен для FakeTLS-секрета, по умолчанию www.microsoft.com
+--host HOSTNAME      Домен для FakeTLS-секрета, по умолчанию <public-ip>.sslip.io
 --secret SECRET      Использовать готовый mtg secret вместо генерации нового
 --rotate-secret      Сгенерировать новый secret, даже если /etc/mtg.toml уже существует
+--prefer-ip MODE     Режим выбора IP для Telegram DC, по умолчанию only-ipv4
+--public-ipv4 IP     Публичный IPv4 для ссылок и doctor-проверок, по умолчанию автоопределение
 --version VERSION    Поставить конкретную версию mtg, например v2.2.8
 --no-firewall        Не менять правила ufw/firewalld
 --force              Пропустить проверку занятого порта

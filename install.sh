@@ -5,9 +5,11 @@ MTG_REPO="${MTG_REPO:-9seconds/mtg}"
 MTG_VERSION="${MTG_VERSION:-latest}"
 MTG_PORT="${MTG_PORT:-443}"
 MTG_BIND="${MTG_BIND:-}"
-MTG_FAKE_TLS_HOST="${MTG_FAKE_TLS_HOST:-www.microsoft.com}"
+MTG_FAKE_TLS_HOST="${MTG_FAKE_TLS_HOST:-}"
 MTG_SECRET="${MTG_SECRET:-}"
 MTG_ROTATE_SECRET="${MTG_ROTATE_SECRET:-0}"
+MTG_PREFER_IP="${MTG_PREFER_IP:-only-ipv4}"
+MTG_PUBLIC_IPV4="${MTG_PUBLIC_IPV4:-}"
 MTG_CONFIG="${MTG_CONFIG:-/etc/mtg.toml}"
 MTG_BIN="${MTG_BIN:-/usr/local/bin/mtg}"
 MTG_SERVICE="${MTG_SERVICE:-/etc/systemd/system/mtg.service}"
@@ -24,9 +26,11 @@ Usage:
 Options:
   --port PORT          Public TCP port to listen on. Default: 443
   --bind ADDR:PORT     Full bind address. Default: 0.0.0.0:<port>
-  --host HOSTNAME      FakeTLS hostname for generated secret. Default: www.microsoft.com
+  --host HOSTNAME      FakeTLS hostname for generated secret. Default: <public-ip>.sslip.io
   --secret SECRET      Use existing mtg secret instead of generating a new one.
   --rotate-secret      Generate a new secret even if /etc/mtg.toml already exists.
+  --prefer-ip MODE     Telegram DC IP mode. Default: only-ipv4
+  --public-ipv4 IP     Public IPv4 for access links and doctor checks. Default: auto-detect
   --version VERSION    mtg version/tag to install, for example v2.2.8. Default: latest
   --no-firewall        Do not modify ufw/firewalld rules.
   --force              Skip local port occupation pre-check.
@@ -34,7 +38,8 @@ Options:
 
 Environment variables:
   MTG_PORT, MTG_BIND, MTG_FAKE_TLS_HOST, MTG_SECRET, MTG_VERSION,
-  MTG_ROTATE_SECRET=1, MTG_NO_FIREWALL=1, MTG_FORCE=1
+  MTG_ROTATE_SECRET=1, MTG_PREFER_IP, MTG_PUBLIC_IPV4,
+  MTG_NO_FIREWALL=1, MTG_FORCE=1
 EOF
 }
 
@@ -49,7 +54,7 @@ die() {
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "run as root, for example: curl -fsSL <install-url> | sudo bash"
+    die "run as root, for example: sudo bash install.sh"
   fi
 }
 
@@ -79,6 +84,16 @@ parse_args() {
       --rotate-secret)
         MTG_ROTATE_SECRET=1
         shift
+        ;;
+      --prefer-ip)
+        [[ $# -ge 2 ]] || die "--prefer-ip requires a value"
+        MTG_PREFER_IP="$2"
+        shift 2
+        ;;
+      --public-ipv4)
+        [[ $# -ge 2 ]] || die "--public-ipv4 requires a value"
+        MTG_PUBLIC_IPV4="$2"
+        shift 2
         ;;
       --version)
         [[ $# -ge 2 ]] || die "--version requires a value"
@@ -194,6 +209,18 @@ read_existing_secret() {
   sed -n 's/^[[:space:]]*secret[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$path" | head -n 1
 }
 
+detect_public_ipv4() {
+  local ip
+  ip="$(curl -4 -fsS --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s' "$ip"
+  fi
+  return 0
+}
+
 download_and_install_mtg() {
   local tag version arch asset checksums base_url tmpdir mtg_path
 
@@ -233,6 +260,16 @@ write_config() {
   fi
 
   [[ "$MTG_SECRET" != *\"* ]] || die "secret must not contain double quotes"
+  [[ "$MTG_FAKE_TLS_HOST" != *\"* ]] || die "hostname must not contain double quotes"
+  [[ "$MTG_PREFER_IP" != *\"* ]] || die "prefer-ip must not contain double quotes"
+  [[ "$MTG_PUBLIC_IPV4" != *\"* ]] || die "public IPv4 must not contain double quotes"
+
+  if [[ -z "$MTG_PUBLIC_IPV4" ]]; then
+    MTG_PUBLIC_IPV4="$(detect_public_ipv4)"
+    if [[ -n "$MTG_PUBLIC_IPV4" ]]; then
+      log "Detected public IPv4: ${MTG_PUBLIC_IPV4}"
+    fi
+  fi
 
   if [[ -z "$MTG_SECRET" && "$MTG_ROTATE_SECRET" != "1" ]]; then
     MTG_SECRET="$(read_existing_secret "$MTG_CONFIG")"
@@ -242,6 +279,13 @@ write_config() {
   fi
 
   if [[ -z "$MTG_SECRET" ]]; then
+    if [[ -z "$MTG_FAKE_TLS_HOST" ]]; then
+      if [[ -n "$MTG_PUBLIC_IPV4" ]]; then
+        MTG_FAKE_TLS_HOST="${MTG_PUBLIC_IPV4}.sslip.io"
+      else
+        MTG_FAKE_TLS_HOST="www.microsoft.com"
+      fi
+    fi
     log "Generating FakeTLS secret for ${MTG_FAKE_TLS_HOST}"
     MTG_SECRET="$("$MTG_BIN" generate-secret -x "$MTG_FAKE_TLS_HOST")"
   fi
@@ -250,7 +294,11 @@ write_config() {
   cat > "$MTG_CONFIG" <<EOF
 secret = "$MTG_SECRET"
 bind-to = "$MTG_BIND"
+prefer-ip = "$MTG_PREFER_IP"
 EOF
+  if [[ -n "$MTG_PUBLIC_IPV4" ]]; then
+    printf 'public-ipv4 = "%s"\n' "$MTG_PUBLIC_IPV4" >> "$MTG_CONFIG"
+  fi
   chmod 0644 "$MTG_CONFIG"
 }
 
