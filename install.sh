@@ -7,6 +7,7 @@ MTG_PORT="${MTG_PORT:-443}"
 MTG_BIND="${MTG_BIND:-}"
 MTG_FAKE_TLS_HOST="${MTG_FAKE_TLS_HOST:-www.microsoft.com}"
 MTG_SECRET="${MTG_SECRET:-}"
+MTG_ROTATE_SECRET="${MTG_ROTATE_SECRET:-0}"
 MTG_CONFIG="${MTG_CONFIG:-/etc/mtg.toml}"
 MTG_BIN="${MTG_BIN:-/usr/local/bin/mtg}"
 MTG_SERVICE="${MTG_SERVICE:-/etc/systemd/system/mtg.service}"
@@ -25,6 +26,7 @@ Options:
   --bind ADDR:PORT     Full bind address. Default: 0.0.0.0:<port>
   --host HOSTNAME      FakeTLS hostname for generated secret. Default: www.microsoft.com
   --secret SECRET      Use existing mtg secret instead of generating a new one.
+  --rotate-secret      Generate a new secret even if /etc/mtg.toml already exists.
   --version VERSION    mtg version/tag to install, for example v2.2.8. Default: latest
   --no-firewall        Do not modify ufw/firewalld rules.
   --force              Skip local port occupation pre-check.
@@ -32,7 +34,7 @@ Options:
 
 Environment variables:
   MTG_PORT, MTG_BIND, MTG_FAKE_TLS_HOST, MTG_SECRET, MTG_VERSION,
-  MTG_NO_FIREWALL=1, MTG_FORCE=1
+  MTG_ROTATE_SECRET=1, MTG_NO_FIREWALL=1, MTG_FORCE=1
 EOF
 }
 
@@ -73,6 +75,10 @@ parse_args() {
         [[ $# -ge 2 ]] || die "--secret requires a value"
         MTG_SECRET="$2"
         shift 2
+        ;;
+      --rotate-secret)
+        MTG_ROTATE_SECRET=1
+        shift
         ;;
       --version)
         [[ $# -ge 2 ]] || die "--version requires a value"
@@ -182,6 +188,12 @@ backup_file() {
   fi
 }
 
+read_existing_secret() {
+  local path="$1"
+  [[ -f "$path" ]] || return 0
+  sed -n 's/^[[:space:]]*secret[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$path" | head -n 1
+}
+
 download_and_install_mtg() {
   local tag version arch asset checksums base_url tmpdir mtg_path
 
@@ -221,6 +233,13 @@ write_config() {
   fi
 
   [[ "$MTG_SECRET" != *\"* ]] || die "secret must not contain double quotes"
+
+  if [[ -z "$MTG_SECRET" && "$MTG_ROTATE_SECRET" != "1" ]]; then
+    MTG_SECRET="$(read_existing_secret "$MTG_CONFIG")"
+    if [[ -n "$MTG_SECRET" ]]; then
+      log "Keeping existing secret from ${MTG_CONFIG}"
+    fi
+  fi
 
   if [[ -z "$MTG_SECRET" ]]; then
     log "Generating FakeTLS secret for ${MTG_FAKE_TLS_HOST}"

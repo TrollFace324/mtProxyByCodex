@@ -6,10 +6,10 @@
 
 ## Быстрая установка
 
-После публикации репозитория на GitHub замени `YOUR_GITHUB_USERNAME` на свой логин:
+Скопируй файлы проекта на Linux-сервер и запусти:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/mtProxyByCodex/main/install.sh | sudo bash
+sudo bash install.sh
 ```
 
 По умолчанию прокси поднимается на `443/tcp` с FakeTLS-доменом `www.microsoft.com`.
@@ -17,13 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/mtProxyByCodex
 ## Установка с параметрами
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/mtProxyByCodex/main/install.sh | sudo bash -s -- --port 8443 --host www.cloudflare.com
-```
-
-Если репозиторий уже склонирован на сервер:
-
-```bash
-sudo bash install.sh --port 443 --host www.microsoft.com
+sudo bash install.sh --port 8443 --host www.cloudflare.com
 ```
 
 Доступные параметры:
@@ -33,6 +27,7 @@ sudo bash install.sh --port 443 --host www.microsoft.com
 --bind ADDR:PORT     Полный адрес bind, по умолчанию 0.0.0.0:<port>
 --host HOSTNAME      Домен для FakeTLS-секрета, по умолчанию www.microsoft.com
 --secret SECRET      Использовать готовый mtg secret вместо генерации нового
+--rotate-secret      Сгенерировать новый secret, даже если /etc/mtg.toml уже существует
 --version VERSION    Поставить конкретную версию mtg, например v2.2.8
 --no-firewall        Не менять правила ufw/firewalld
 --force              Пропустить проверку занятого порта
@@ -72,10 +67,16 @@ systemctl restart mtg
 
 ## Обновление
 
-Запусти установку повторно. Скрипт сделает backup старых `/etc/mtg.toml` и `/etc/systemd/system/mtg.service`, скачает выбранную или последнюю версию `mtg` и перезапустит сервис.
+Запусти установку повторно. Скрипт сделает backup старых `/etc/mtg.toml` и `/etc/systemd/system/mtg.service`, сохранит текущий `secret`, скачает выбранную или последнюю версию `mtg` и перезапустит сервис. Ссылка для пользователей при обычном обновлении не меняется.
 
 ```bash
 sudo bash install.sh
+```
+
+Если нужно специально сменить ссылку и secret:
+
+```bash
+sudo bash install.sh --rotate-secret
 ```
 
 ## Удаление
