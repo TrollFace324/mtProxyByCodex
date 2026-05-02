@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MTG_REPO="${MTG_REPO:-9seconds/mtg}"
+MTG_VERSION="${MTG_VERSION:-latest}"
+MTG_PORT="${MTG_PORT:-443}"
+MTG_BIND="${MTG_BIND:-}"
+MTG_FAKE_TLS_HOST="${MTG_FAKE_TLS_HOST:-www.microsoft.com}"
+MTG_SECRET="${MTG_SECRET:-}"
+MTG_CONFIG="${MTG_CONFIG:-/etc/mtg.toml}"
+MTG_BIN="${MTG_BIN:-/usr/local/bin/mtg}"
+MTG_SERVICE="${MTG_SERVICE:-/etc/systemd/system/mtg.service}"
+MTG_NO_FIREWALL="${MTG_NO_FIREWALL:-0}"
+MTG_FORCE="${MTG_FORCE:-0}"
+
+usage() {
+  cat <<'EOF'
+Install mtg Telegram MTProto proxy.
+
+Usage:
+  sudo bash install.sh [options]
+
+Options:
+  --port PORT          Public TCP port to listen on. Default: 443
+  --bind ADDR:PORT     Full bind address. Default: 0.0.0.0:<port>
+  --host HOSTNAME      FakeTLS hostname for generated secret. Default: www.microsoft.com
+  --secret SECRET      Use existing mtg secret instead of generating a new one.
+  --version VERSION    mtg version/tag to install, for example v2.2.8. Default: latest
+  --no-firewall        Do not modify ufw/firewalld rules.
+  --force              Skip local port occupation pre-check.
+  -h, --help           Show this help.
+
+Environment variables:
+  MTG_PORT, MTG_BIND, MTG_FAKE_TLS_HOST, MTG_SECRET, MTG_VERSION,
+  MTG_NO_FIREWALL=1, MTG_FORCE=1
+EOF
+}
+
+log() {
+  printf '[mtproxy] %s\n' "$*"
+}
+
+die() {
+  printf '[mtproxy] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "run as root, for example: curl -fsSL <install-url> | sudo bash"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        [[ $# -ge 2 ]] || die "--port requires a value"
+        MTG_PORT="$2"
+        shift 2
+        ;;
+      --bind)
+        [[ $# -ge 2 ]] || die "--bind requires a value"
+        MTG_BIND="$2"
+        shift 2
+        ;;
+      --host)
+        [[ $# -ge 2 ]] || die "--host requires a value"
+        MTG_FAKE_TLS_HOST="$2"
+        shift 2
+        ;;
+      --secret)
+        [[ $# -ge 2 ]] || die "--secret requires a value"
+        MTG_SECRET="$2"
+        shift 2
+        ;;
+      --version)
+        [[ $# -ge 2 ]] || die "--version requires a value"
+        MTG_VERSION="$2"
+        shift 2
+        ;;
+      --no-firewall)
+        MTG_NO_FIREWALL=1
+        shift
+        ;;
+      --force)
+        MTG_FORCE=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    armv7l|armv7*) printf 'armv7' ;;
+    armv6l|armv6*) printf 'armv6' ;;
+    i386|i686) printf '386' ;;
+    *) die "unsupported CPU architecture: $(uname -m)" ;;
+  esac
+}
+
+extract_port_from_bind() {
+  local bind="$1"
+  bind="${bind##*:}"
+  bind="${bind%]}"
+  printf '%s' "$bind"
+}
+
+validate_port() {
+  [[ "$MTG_PORT" =~ ^[0-9]+$ ]] || die "port must be a number: $MTG_PORT"
+  (( MTG_PORT >= 1 && MTG_PORT <= 65535 )) || die "port must be in range 1..65535: $MTG_PORT"
+}
+
+install_dependencies() {
+  local missing=()
+  local cmd
+
+  for cmd in curl tar sha256sum systemctl sed grep awk find install ss; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  log "Installing required packages: ${missing[*]}"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y ca-certificates curl tar coreutils systemd sed grep gawk findutils iproute2
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates curl tar coreutils systemd sed grep gawk findutils iproute
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates curl tar coreutils systemd sed grep gawk findutils iproute
+  else
+    die "unsupported package manager. Install manually: ${missing[*]}"
+  fi
+
+  command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+}
+
+resolve_version_tag() {
+  if [[ "$MTG_VERSION" == "latest" ]]; then
+    curl -fsSL -H 'User-Agent: mtproxy-installer' \
+      "https://api.github.com/repos/${MTG_REPO}/releases/latest" |
+      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+      head -n 1
+  elif [[ "$MTG_VERSION" == v* ]]; then
+    printf '%s' "$MTG_VERSION"
+  else
+    printf 'v%s' "$MTG_VERSION"
+  fi
+}
+
+check_port_available() {
+  if [[ "$MTG_FORCE" == "1" ]]; then
+    return
+  fi
+
+  if systemctl is-active --quiet mtg 2>/dev/null; then
+    return
+  fi
+
+  if ss -ltnH "sport = :${MTG_PORT}" 2>/dev/null | grep -q .; then
+    die "port ${MTG_PORT}/tcp is already in use. Choose another --port or use --force if you know what you are doing."
+  fi
+}
+
+backup_file() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    cp -a "$path" "${path}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+}
+
+download_and_install_mtg() {
+  local tag version arch asset checksums base_url tmpdir mtg_path
+
+  tag="$(resolve_version_tag)"
+  [[ -n "$tag" ]] || die "cannot resolve mtg release tag"
+
+  version="${tag#v}"
+  arch="$(detect_arch)"
+  asset="mtg-${version}-linux-${arch}.tar.gz"
+  checksums="mtg-${version}-checksums.txt"
+  base_url="https://github.com/${MTG_REPO}/releases/download/${tag}"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  log "Downloading ${MTG_REPO} ${tag} for linux-${arch}"
+  curl -fL --retry 3 -o "${tmpdir}/${asset}" "${base_url}/${asset}"
+  curl -fL --retry 3 -o "${tmpdir}/${checksums}" "${base_url}/${checksums}"
+
+  grep -E "[[:space:]]${asset}$" "${tmpdir}/${checksums}" > "${tmpdir}/${asset}.sha256" ||
+    die "checksum for ${asset} not found"
+  (cd "$tmpdir" && sha256sum -c "${asset}.sha256")
+
+  tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
+  mtg_path="$(find "$tmpdir" -type f -name mtg | head -n 1)"
+  [[ -n "$mtg_path" ]] || die "mtg binary not found in release archive"
+
+  install -m 0755 "$mtg_path" "$MTG_BIN"
+  log "Installed $("$MTG_BIN" --version | head -n 1)"
+}
+
+write_config() {
+  if [[ -z "$MTG_BIND" ]]; then
+    MTG_BIND="0.0.0.0:${MTG_PORT}"
+  else
+    MTG_PORT="$(extract_port_from_bind "$MTG_BIND")"
+    validate_port
+  fi
+
+  [[ "$MTG_SECRET" != *\"* ]] || die "secret must not contain double quotes"
+
+  if [[ -z "$MTG_SECRET" ]]; then
+    log "Generating FakeTLS secret for ${MTG_FAKE_TLS_HOST}"
+    MTG_SECRET="$("$MTG_BIN" generate-secret -x "$MTG_FAKE_TLS_HOST")"
+  fi
+
+  backup_file "$MTG_CONFIG"
+  cat > "$MTG_CONFIG" <<EOF
+secret = "$MTG_SECRET"
+bind-to = "$MTG_BIND"
+EOF
+  chmod 0644 "$MTG_CONFIG"
+}
+
+write_systemd_service() {
+  backup_file "$MTG_SERVICE"
+  cat > "$MTG_SERVICE" <<EOF
+[Unit]
+Description=mtg - Telegram MTProto proxy server
+Documentation=https://github.com/${MTG_REPO}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${MTG_BIN} run ${MTG_CONFIG}
+Restart=always
+RestartSec=3
+DynamicUser=true
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+open_firewall() {
+  if [[ "$MTG_NO_FIREWALL" == "1" ]]; then
+    log "Skipping firewall changes"
+    return
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi '^Status: active'; then
+    log "Opening ${MTG_PORT}/tcp in ufw"
+    ufw allow "${MTG_PORT}/tcp" >/dev/null
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    log "Opening ${MTG_PORT}/tcp in firewalld"
+    firewall-cmd --permanent --add-port="${MTG_PORT}/tcp" >/dev/null
+    firewall-cmd --reload >/dev/null
+  else
+    log "No active ufw/firewalld detected; provider firewall may still need port ${MTG_PORT}/tcp opened manually"
+  fi
+}
+
+start_service() {
+  systemctl daemon-reload
+  systemctl enable mtg >/dev/null
+  systemctl restart mtg
+  sleep 2
+
+  if ! systemctl is-active --quiet mtg; then
+    journalctl -u mtg -n 80 --no-pager >&2 || true
+    die "mtg service failed to start"
+  fi
+}
+
+print_result() {
+  echo
+  log "Installation complete"
+  log "Service: systemctl status mtg"
+  log "Logs:    journalctl -u mtg -f"
+  echo
+  "$MTG_BIN" access "$MTG_CONFIG" || {
+    log "Could not render access links automatically. Config is stored at ${MTG_CONFIG}."
+  }
+}
+
+main() {
+  parse_args "$@"
+  require_root
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    die "Linux is required"
+  fi
+
+  if [[ -n "$MTG_BIND" ]]; then
+    MTG_PORT="$(extract_port_from_bind "$MTG_BIND")"
+  fi
+  validate_port
+
+  install_dependencies
+  check_port_available
+  download_and_install_mtg
+  write_config
+  write_systemd_service
+  open_firewall
+  start_service
+  print_result
+}
+
+main "$@"

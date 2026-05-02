@@ -1,0 +1,10 @@
+.env
+.env.*
+*.log
+*.bak
+*.tmp
+tmp/
+dist/
+coverage/
+.DS_Store
+Thumbs.db
