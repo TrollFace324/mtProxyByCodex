@@ -8,8 +8,10 @@ MTG_BIND="${MTG_BIND:-}"
 MTG_FAKE_TLS_HOST="${MTG_FAKE_TLS_HOST:-}"
 MTG_SECRET="${MTG_SECRET:-}"
 MTG_ROTATE_SECRET="${MTG_ROTATE_SECRET:-0}"
-MTG_PREFER_IP="${MTG_PREFER_IP:-only-ipv4}"
+MTG_IP_VERSION="${MTG_IP_VERSION:-}"
+MTG_PREFER_IP="${MTG_PREFER_IP:-}"
 MTG_PUBLIC_IPV4="${MTG_PUBLIC_IPV4:-}"
+MTG_PUBLIC_IPV6="${MTG_PUBLIC_IPV6:-}"
 MTG_CONFIG="${MTG_CONFIG:-/etc/mtg.toml}"
 MTG_BIN="${MTG_BIN:-/usr/local/bin/mtg}"
 MTG_SERVICE="${MTG_SERVICE:-/etc/systemd/system/mtg.service}"
@@ -29,8 +31,10 @@ Options:
   --host HOSTNAME      FakeTLS hostname for generated secret. Default: <public-ip>.sslip.io
   --secret SECRET      Use existing mtg secret instead of generating a new one.
   --rotate-secret      Generate a new secret even if /etc/mtg.toml already exists.
-  --prefer-ip MODE     Telegram DC IP mode. Default: only-ipv4
+  --ip-version MODE    Ask/use public IP version: ipv4 or ipv6. Default: prompt, then ipv4
+  --prefer-ip MODE     Advanced Telegram DC IP mode. Default: derived from --ip-version
   --public-ipv4 IP     Public IPv4 for access links and doctor checks. Default: auto-detect
+  --public-ipv6 IP     Public IPv6 for access links and doctor checks. Default: auto-detect
   --version VERSION    mtg version/tag to install, for example v2.2.8. Default: latest
   --no-firewall        Do not modify ufw/firewalld rules.
   --force              Skip local port occupation pre-check.
@@ -38,7 +42,8 @@ Options:
 
 Environment variables:
   MTG_PORT, MTG_BIND, MTG_FAKE_TLS_HOST, MTG_SECRET, MTG_VERSION,
-  MTG_ROTATE_SECRET=1, MTG_PREFER_IP, MTG_PUBLIC_IPV4,
+  MTG_ROTATE_SECRET=1, MTG_IP_VERSION, MTG_PREFER_IP,
+  MTG_PUBLIC_IPV4, MTG_PUBLIC_IPV6,
   MTG_NO_FIREWALL=1, MTG_FORCE=1
 EOF
 }
@@ -85,6 +90,11 @@ parse_args() {
         MTG_ROTATE_SECRET=1
         shift
         ;;
+      --ip-version|--ip)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        MTG_IP_VERSION="$2"
+        shift 2
+        ;;
       --prefer-ip)
         [[ $# -ge 2 ]] || die "--prefer-ip requires a value"
         MTG_PREFER_IP="$2"
@@ -93,6 +103,11 @@ parse_args() {
       --public-ipv4)
         [[ $# -ge 2 ]] || die "--public-ipv4 requires a value"
         MTG_PUBLIC_IPV4="$2"
+        shift 2
+        ;;
+      --public-ipv6)
+        [[ $# -ge 2 ]] || die "--public-ipv6 requires a value"
+        MTG_PUBLIC_IPV6="$2"
         shift 2
         ;;
       --version)
@@ -140,6 +155,60 @@ extract_port_from_bind() {
 validate_port() {
   [[ "$MTG_PORT" =~ ^[0-9]+$ ]] || die "port must be a number: $MTG_PORT"
   (( MTG_PORT >= 1 && MTG_PORT <= 65535 )) || die "port must be in range 1..65535: $MTG_PORT"
+}
+
+prompt_ip_version() {
+  if [[ -n "$MTG_IP_VERSION" || -n "$MTG_PREFER_IP" ]]; then
+    return
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    echo
+    echo "Choose proxy IP version:"
+    echo "  1) IPv4 (recommended)"
+    echo "  2) IPv6"
+    read -r -p "Select [1]: " MTG_IP_VERSION || true
+  fi
+
+  MTG_IP_VERSION="${MTG_IP_VERSION:-ipv4}"
+  case "${MTG_IP_VERSION,,}" in
+    1) MTG_IP_VERSION="ipv4" ;;
+    2) MTG_IP_VERSION="ipv6" ;;
+  esac
+}
+
+normalize_ip_settings() {
+  local mode
+
+  prompt_ip_version
+
+  if [[ -n "$MTG_PREFER_IP" ]]; then
+    mode="${MTG_PREFER_IP,,}"
+  else
+    mode="${MTG_IP_VERSION,,}"
+  fi
+
+  case "$mode" in
+    1|4|ip4|ipv4|only-ipv4)
+      MTG_IP_VERSION="ipv4"
+      MTG_PREFER_IP="only-ipv4"
+      ;;
+    2|6|ip6|ipv6|only-ipv6)
+      MTG_IP_VERSION="ipv6"
+      MTG_PREFER_IP="only-ipv6"
+      ;;
+    prefer4|prefer-ipv4)
+      MTG_IP_VERSION="ipv4"
+      MTG_PREFER_IP="prefer-ipv4"
+      ;;
+    prefer6|prefer-ipv6)
+      MTG_IP_VERSION="ipv6"
+      MTG_PREFER_IP="prefer-ipv6"
+      ;;
+    *)
+      die "unsupported IP mode: ${mode}. Use ipv4, ipv6, prefer-ipv4, prefer-ipv6, only-ipv4, or only-ipv6."
+      ;;
+  esac
 }
 
 install_dependencies() {
@@ -221,6 +290,24 @@ detect_public_ipv4() {
   return 0
 }
 
+detect_public_ipv6() {
+  local ip
+  ip="$(curl -6 -fsS --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+  fi
+  if [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+    printf '%s' "$ip"
+  fi
+  return 0
+}
+
+sslip_host_for_ipv6() {
+  local ip="${1,,}"
+  ip="${ip//:/-}"
+  printf '%s.sslip.io' "$ip"
+}
+
 download_and_install_mtg() {
   local tag version arch asset checksums base_url tmpdir mtg_path
 
@@ -252,8 +339,14 @@ download_and_install_mtg() {
 }
 
 write_config() {
+  normalize_ip_settings
+
   if [[ -z "$MTG_BIND" ]]; then
-    MTG_BIND="0.0.0.0:${MTG_PORT}"
+    if [[ "$MTG_IP_VERSION" == "ipv6" ]]; then
+      MTG_BIND="[::]:${MTG_PORT}"
+    else
+      MTG_BIND="0.0.0.0:${MTG_PORT}"
+    fi
   else
     MTG_PORT="$(extract_port_from_bind "$MTG_BIND")"
     validate_port
@@ -263,11 +356,21 @@ write_config() {
   [[ "$MTG_FAKE_TLS_HOST" != *\"* ]] || die "hostname must not contain double quotes"
   [[ "$MTG_PREFER_IP" != *\"* ]] || die "prefer-ip must not contain double quotes"
   [[ "$MTG_PUBLIC_IPV4" != *\"* ]] || die "public IPv4 must not contain double quotes"
+  [[ "$MTG_PUBLIC_IPV6" != *\"* ]] || die "public IPv6 must not contain double quotes"
 
-  if [[ -z "$MTG_PUBLIC_IPV4" ]]; then
+  if [[ "$MTG_IP_VERSION" == "ipv6" && -z "$MTG_PUBLIC_IPV6" ]]; then
+    MTG_PUBLIC_IPV6="$(detect_public_ipv6)"
+    if [[ -n "$MTG_PUBLIC_IPV6" ]]; then
+      log "Detected public IPv6: ${MTG_PUBLIC_IPV6}"
+    else
+      log "Could not auto-detect public IPv6; pass --public-ipv6 if mtg access links need it"
+    fi
+  elif [[ "$MTG_IP_VERSION" == "ipv4" && -z "$MTG_PUBLIC_IPV4" ]]; then
     MTG_PUBLIC_IPV4="$(detect_public_ipv4)"
     if [[ -n "$MTG_PUBLIC_IPV4" ]]; then
       log "Detected public IPv4: ${MTG_PUBLIC_IPV4}"
+    else
+      log "Could not auto-detect public IPv4; pass --public-ipv4 if mtg access links need it"
     fi
   fi
 
@@ -280,7 +383,9 @@ write_config() {
 
   if [[ -z "$MTG_SECRET" ]]; then
     if [[ -z "$MTG_FAKE_TLS_HOST" ]]; then
-      if [[ -n "$MTG_PUBLIC_IPV4" ]]; then
+      if [[ "$MTG_IP_VERSION" == "ipv6" && -n "$MTG_PUBLIC_IPV6" ]]; then
+        MTG_FAKE_TLS_HOST="$(sslip_host_for_ipv6 "$MTG_PUBLIC_IPV6")"
+      elif [[ -n "$MTG_PUBLIC_IPV4" ]]; then
         MTG_FAKE_TLS_HOST="${MTG_PUBLIC_IPV4}.sslip.io"
       else
         MTG_FAKE_TLS_HOST="www.microsoft.com"
@@ -298,6 +403,9 @@ prefer-ip = "$MTG_PREFER_IP"
 EOF
   if [[ -n "$MTG_PUBLIC_IPV4" ]]; then
     printf 'public-ipv4 = "%s"\n' "$MTG_PUBLIC_IPV4" >> "$MTG_CONFIG"
+  fi
+  if [[ -n "$MTG_PUBLIC_IPV6" ]]; then
+    printf 'public-ipv6 = "%s"\n' "$MTG_PUBLIC_IPV6" >> "$MTG_CONFIG"
   fi
   chmod 0644 "$MTG_CONFIG"
 }
