@@ -392,7 +392,7 @@ write_config() {
       fi
     fi
     log "Generating FakeTLS secret for ${MTG_FAKE_TLS_HOST}"
-    MTG_SECRET="$("$MTG_BIN" generate-secret -x "$MTG_FAKE_TLS_HOST")"
+    MTG_SECRET="$("$MTG_BIN" generate-secret --hex "$MTG_FAKE_TLS_HOST")"
   fi
 
   backup_file "$MTG_CONFIG"

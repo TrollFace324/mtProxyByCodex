@@ -37,6 +37,22 @@ sudo bash install.sh --port 8443 --host www.cloudflare.com
 sudo bash install.sh --port 8443 --ip-version ipv4
 ```
 
+Стабильный IPv4-вариант с явным IP сервера:
+
+```bash
+SERVER_IP="1.2.3.4"
+sudo bash install.sh --port 8443 --ip-version ipv4 --public-ipv4 "$SERVER_IP" --host "${SERVER_IP}.sslip.io" --rotate-secret
+```
+
+В этом режиме установщик сгенерирует FakeTLS-secret через `mtg generate-secret --hex "${SERVER_IP}.sslip.io"` и запишет конфиг вида:
+
+```toml
+secret = "ee..."
+bind-to = "0.0.0.0:8443"
+prefer-ip = "only-ipv4"
+public-ipv4 = "1.2.3.4"
+```
+
 Установка только через IPv6:
 
 ```bash
